@@ -1,0 +1,12 @@
+[package]
+name = "toy-git"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.3.0"                                  # helps manage buffers
+clap = { version = "4.5.55", features = ["derive"] }
+flate2 = "1.0.34"                                # compression
+fmt = "0.1.0"
+sha1 = "0.10.6"
+tempfile = "3"
