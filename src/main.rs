@@ -51,12 +51,59 @@ enum Commands {
     },
     /// 将暂存区的内容写为一个 tree 对象
     WriteTree,
-    /// 将暂存区创建为一次提交
+    /// [plumbing] 创建一个 commit 对象（不更新分支引用）
+    CommitTree {
+        /// tree 对象的 hash
+        #[arg(short)]
+        t: String,
+        /// 父 commit 的 hash（首次提交可省略）
+        #[arg(short)]
+        p: Option<String>,
+        /// 提交信息
+        #[arg(short)]
+        m: String,
+    },
+    /// [porcelain] 将暂存区创建为一次提交（= write-tree + commit-tree + 更新 HEAD）
     Commit {
         /// 提交信息
         #[arg(short)]
         m: String,
     },
+}
+
+// ===== HEAD / 分支引用 =====
+//
+// .git/HEAD 的内容是一个符号引用，指向当前分支：
+//   ref: refs/heads/main
+//
+// .git/refs/heads/main 存储的是该分支最新的 commit hash。
+// 如果这个文件不存在，说明还没有任何提交。
+
+/// 读取 HEAD 指向的引用路径（如 "refs/heads/main"），不包含 "ref: " 前缀
+fn read_head_ref_path() -> String {
+    let head = fs::read_to_string(".git/HEAD").unwrap();
+    head.trim()
+        .strip_prefix("ref: ")
+        .unwrap()
+        .to_string()
+}
+
+/// 读取当前分支的最新 commit hash。如果还没有提交，返回 None。
+fn get_parent_commit() -> Option<String> {
+    let ref_path = read_head_ref_path();
+    fs::read_to_string(format!(".git/{}", ref_path))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// 更新当前分支的引用，指向新的 commit hash。
+fn update_head_ref(commit_hash: &str) {
+    let ref_path = read_head_ref_path();
+    let full_path = format!(".git/{}", ref_path);
+    if let Some(parent_dir) = Path::new(&full_path).parent() {
+        fs::create_dir_all(parent_dir).unwrap();
+    }
+    fs::write(&full_path, format!("{}\n", commit_hash)).unwrap();
 }
 
 // ===== main =====
@@ -73,7 +120,6 @@ fn main() {
         }
 
         Some(Commands::CatFile { p }) => {
-            // 对象路径：.git/objects/<前2位>/<后38位>
             let mut path = ".git/objects/".to_owned();
             path.push_str(&p[0..2]);
             path.push('/');
@@ -144,8 +190,30 @@ fn main() {
             println!("{}", oid);
         }
 
+        // --- commit-tree (plumbing) ---
+        //
+        // 只做一件事：把已有的 tree hash 包装成 commit 对象。
+        // 不做 write-tree，不更新分支引用。这是最纯粹的 commit 创建操作。
+        //
+        // 真实 git 中，commit-tree 通常从 stdin 或环境变量读取 author 信息，
+        // 这里简化为固定的 "toy-git"。
+        Some(Commands::CommitTree { t, p, m }) => {
+            let parent = p.as_deref();
+            let (commit_hash, _) = create_commit(&t, parent, &m);
+
+            // 判断是否首次提交（没有父提交就是 root commit）
+            let root_msg = if p.is_none() { " (root-commit)" } else { "" };
+            println!("[commit{root_msg}] {}", commit_hash);
+        }
+
+        // --- commit (porcelain) ---
+        //
+        // 高层命令，组合了三个底层操作：
+        //   1. write-tree     → 将暂存区拍成 tree 对象
+        //   2. commit-tree    → 将 tree 包装成 commit 对象
+        //   3. update-ref     → 更新分支引用，指向新的 commit
         Some(Commands::Commit { m }) => {
-            // 1. 把暂存区写成 tree 对象
+            // 1. write-tree：把暂存区写成 tree
             let entries = read_index().unwrap();
 
             if entries.is_empty() {
@@ -155,28 +223,14 @@ fn main() {
 
             let (tree_hash, _) = write_tree(&entries);
 
-            // 2. 获取当前 HEAD 指向的 commit 作为父提交
-            //
-            //    .git/HEAD 内容："ref: refs/heads/main\n"
-            //    → 读取 .git/refs/heads/main → 获得当前 commit 的 hash
-            //    → 如果 ref 文件不存在，说明是首次提交，没有父提交
-            let head = fs::read_to_string(".git/HEAD").unwrap();
-            let ref_path = head.trim().strip_prefix("ref: ").unwrap();
-            let parent = fs::read_to_string(format!(".git/{}", ref_path)).ok();
-            let parent_hash = parent.as_ref().map(|p| p.trim());
+            // 2. commit-tree：创建 commit 对象
+            let parent_hash = get_parent_commit();
+            let (commit_hash, _) = create_commit(&tree_hash, parent_hash.as_deref(), &m);
 
-            // 3. 创建 commit 对象
-            let (commit_hash, _) = create_commit(&tree_hash, parent_hash, &m);
+            // 3. update-ref：更新分支引用
+            update_head_ref(&commit_hash);
 
-            // 4. 更新分支引用，让 HEAD 指向新的 commit
-            if let Some(parent_dir) = Path::new(&format!(".git/{}", ref_path)).parent() {
-                fs::create_dir_all(parent_dir).unwrap();
-            }
-            fs::write(format!(".git/{}", ref_path), format!("{}\n", commit_hash)).unwrap();
-
-            // 输出信息
-            let is_initial = parent_hash.is_none();
-            let root_msg = if is_initial { " (root-commit)" } else { "" };
+            let root_msg = if parent_hash.is_none() { " (root-commit)" } else { "" };
             println!("[main{root_msg}] {}", commit_hash);
         }
 
