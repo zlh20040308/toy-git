@@ -15,10 +15,11 @@ mod index;
 
 use std::fs;
 use std::io::Read;
+use std::path::Path;
 
 use clap::{Parser, Subcommand};
 
-use object::{decode_reader, hash_and_store_blob, normalize_tree_mode, store_object};
+use object::{create_commit, decode_reader, hash_and_store_blob, write_tree};
 use index::{read_index, write_index, IndexEntry};
 
 // ===== CLI =====
@@ -50,6 +51,12 @@ enum Commands {
     },
     /// 将暂存区的内容写为一个 tree 对象
     WriteTree,
+    /// 将暂存区创建为一次提交
+    Commit {
+        /// 提交信息
+        #[arg(short)]
+        m: String,
+    },
 }
 
 // ===== main =====
@@ -88,7 +95,7 @@ fn main() {
 
         Some(Commands::UpdateIndex { file }) => {
             // 1. 存 blob
-            let (_oid, sha1_bytes) = hash_and_store_blob(&file).unwrap();
+            let (_, sha1_bytes) = hash_and_store_blob(&file).unwrap();
 
             // 2. 收集文件元数据
             use std::os::unix::fs::MetadataExt;
@@ -133,22 +140,44 @@ fn main() {
                 std::process::exit(1);
             }
 
-            // 按路径名排序，构建 tree entry
-            let mut sorted: Vec<&IndexEntry> = entries.iter().collect();
-            sorted.sort_by(|a, b| a.path.cmp(&b.path));
+            let (oid, _) = write_tree(&entries);
+            println!("{}", oid);
+        }
 
-            let mut tree_content: Vec<u8> = Vec::new();
-            for entry in &sorted {
-                let mode_str = normalize_tree_mode(entry.mode);
-                tree_content.extend_from_slice(mode_str.as_bytes());
-                tree_content.push(b' ');
-                tree_content.extend_from_slice(entry.path.as_bytes());
-                tree_content.push(0);
-                tree_content.extend_from_slice(&entry.sha1);
+        Some(Commands::Commit { m }) => {
+            // 1. 把暂存区写成 tree 对象
+            let entries = read_index().unwrap();
+
+            if entries.is_empty() {
+                eprintln!("nothing to commit");
+                std::process::exit(1);
             }
 
-            let (oid, _) = store_object("tree", &tree_content);
-            println!("{}", oid);
+            let (tree_hash, _) = write_tree(&entries);
+
+            // 2. 获取当前 HEAD 指向的 commit 作为父提交
+            //
+            //    .git/HEAD 内容："ref: refs/heads/main\n"
+            //    → 读取 .git/refs/heads/main → 获得当前 commit 的 hash
+            //    → 如果 ref 文件不存在，说明是首次提交，没有父提交
+            let head = fs::read_to_string(".git/HEAD").unwrap();
+            let ref_path = head.trim().strip_prefix("ref: ").unwrap();
+            let parent = fs::read_to_string(format!(".git/{}", ref_path)).ok();
+            let parent_hash = parent.as_ref().map(|p| p.trim());
+
+            // 3. 创建 commit 对象
+            let (commit_hash, _) = create_commit(&tree_hash, parent_hash, &m);
+
+            // 4. 更新分支引用，让 HEAD 指向新的 commit
+            if let Some(parent_dir) = Path::new(&format!(".git/{}", ref_path)).parent() {
+                fs::create_dir_all(parent_dir).unwrap();
+            }
+            fs::write(format!(".git/{}", ref_path), format!("{}\n", commit_hash)).unwrap();
+
+            // 输出信息
+            let is_initial = parent_hash.is_none();
+            let root_msg = if is_initial { " (root-commit)" } else { "" };
+            println!("[main{root_msg}] {}", commit_hash);
         }
 
         None => {

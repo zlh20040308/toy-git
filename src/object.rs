@@ -15,6 +15,8 @@ use flate2::read::ZlibEncoder;
 use flate2::Compression;
 use sha1::{Digest, Sha1};
 
+use crate::index::IndexEntry;
+
 /// 解压 zlib 压缩的对象数据，返回文本形式
 pub fn decode_reader(bytes: Vec<u8>) -> io::Result<String> {
     let mut z = ZlibDecoder::new(&bytes[..]);
@@ -95,4 +97,67 @@ pub fn hash_and_store_blob(file_path: &str) -> io::Result<(String, [u8; 20])> {
     file.read_to_string(&mut content)?;
 
     Ok(store_object("blob", content.as_bytes()))
+}
+
+/// 将 index 条目列表构建为一棵 tree 对象，存入 .git/objects。
+///
+/// Tree 对象内容为一组排序后的 entry，每个 entry 格式：
+///   <模式> <路径>\0<20字节原始SHA1>
+///
+/// entry 之间没有分隔符，读取时靠 \0 定位。
+pub fn write_tree(entries: &[IndexEntry]) -> (String, [u8; 20]) {
+    let mut sorted: Vec<&IndexEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut tree_content: Vec<u8> = Vec::new();
+    for entry in &sorted {
+        let mode_str = normalize_tree_mode(entry.mode);
+        tree_content.extend_from_slice(mode_str.as_bytes());
+        tree_content.push(b' ');
+        tree_content.extend_from_slice(entry.path.as_bytes());
+        tree_content.push(0);
+        tree_content.extend_from_slice(&entry.sha1);
+    }
+
+    store_object("tree", &tree_content)
+}
+
+/// 构建并存储一个 commit 对象。
+///
+/// Commit 对象的内容是纯文本，格式：
+///   tree <tree-hash>
+///   parent <parent-hash>        ← 仅首次提交时省略此行
+///   author <name> <email> <timestamp> <timezone>
+///   committer <name> <email> <timestamp> <timezone>
+///
+///   <commit message>
+pub fn create_commit(
+    tree_hash: &str,
+    parent_hash: Option<&str>,
+    message: &str,
+) -> (String, [u8; 20]) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let mut content = format!("tree {}\n", tree_hash);
+    if let Some(parent) = parent_hash {
+        content.push_str(&format!("parent {}\n", parent));
+    }
+    content.push_str(&format!(
+        "author toy-git <toy@git> {} +0800\n",
+        timestamp
+    ));
+    content.push_str(&format!(
+        "committer toy-git <toy@git> {} +0800\n",
+        timestamp
+    ));
+    content.push('\n');
+    content.push_str(message);
+    content.push('\n');
+
+    store_object("commit", content.as_bytes())
 }
